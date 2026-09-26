@@ -114,4 +114,102 @@ function apply(m, p) {
   console.log('✓ 大坐标数值稳定');
 }
 
+// 11. 普通拟合返回结构兼容：inliers 全为 true
+{
+  const dst = SRC.map((p) => apply(TRUE_M, p));
+  const r = Affine.fitAffine(SRC, dst);
+  assert.strictEqual(r.robust, false);
+  assert.strictEqual(r.inlierCount, SRC.length);
+  assert.ok(r.inliers.every(Boolean));
+  console.log('✓ 普通拟合 inliers 全为 true（与稳健模式结构一致）');
+}
+
+// 12. 稳健模式：6 内点（含噪）+ 2 外点 → 剔除外点，矩阵逼近真值，RMSE 仅统计内点
+const ROBUST_SRC = SRC.concat([{ x: 250, y: 260 }, { x: 320, y: 120 }]);
+const ROBUST_DST = (() => {
+  let seed = 7;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 - 0.5; };
+  const noise = 0.4;
+  const inDst = SRC.map((p) => {
+    const q = apply(TRUE_M, p);
+    return { x: q.x + rand() * 2 * noise, y: q.y + rand() * 2 * noise };
+  });
+  return inDst.concat([{ x: 40, y: 470 }, { x: 610, y: 55 }]); // 严重偏离真值映射
+})();
+{
+  const r = Affine.fitAffineRobust(ROBUST_SRC, ROBUST_DST, { tolerance: 2 });
+  assert.strictEqual(r.robust, true);
+  assert.strictEqual(r.inlierCount, 6);
+  assert.deepStrictEqual(r.inliers, [true, true, true, true, true, true, false, false]);
+  for (const k of ['a', 'b', 'd', 'e']) {
+    assert.ok(Math.abs(r.matrix[k] - TRUE_M[k]) < 0.02, `稳健拟合 ${k} 偏差过大`);
+  }
+  for (const k of ['c', 'f']) {
+    assert.ok(Math.abs(r.matrix[k] - TRUE_M[k]) < 1.5, `稳健拟合 ${k} 偏差过大`);
+  }
+  // 外点不计入 RMSE
+  const inRes = r.residuals.filter((_, i) => r.inliers[i]);
+  const expectRmse = Math.sqrt(inRes.reduce((s, v) => s + v * v, 0) / inRes.length);
+  assert.ok(Math.abs(r.rmse - expectRmse) < 1e-12, 'RMSE 应仅统计内点');
+  assert.ok(r.rmse < 2 && r.residuals[6] > 10 && r.residuals[7] > 10, '外点残差大但不计入 RMSE');
+  console.log('✓ 稳健模式剔除外点，矩阵逼近真值，RMSE 仅统计内点');
+}
+
+// 13. 稳健模式：固定顺序评估，结果确定可复现；默认容差生效
+{
+  const r1 = Affine.fitAffineRobust(ROBUST_SRC, ROBUST_DST);
+  const r2 = Affine.fitAffineRobust(ROBUST_SRC, ROBUST_DST);
+  assert.deepStrictEqual(r1, r2);
+  assert.strictEqual(r1.tolerance, Affine.DEFAULT_TOLERANCE);
+  console.log('✓ 稳健模式结果确定可复现，默认容差生效');
+}
+
+// 14. 稳健模式：候选按固定顺序评估并受上限截断（C(20,3)=1140 > 500）
+{
+  const many = [];
+  for (let i = 0; i < 20; i++) many.push({ x: (i * 137) % 541 + (i % 3), y: (i * i * 89) % 433 + (i % 5) });
+  const dstM = many.map((p) => apply(TRUE_M, p));
+  const r = Affine.fitAffineRobust(many, dstM, { tolerance: 1 });
+  assert.strictEqual(r.candidatesEvaluated, Affine.MAX_TRIPLE_CANDIDATES);
+  assert.strictEqual(r.truncated, true);
+  assert.strictEqual(r.inlierCount, 20); // 无噪声，全部内点
+  console.log('✓ 三点候选有上限截断，点多时仍快速完成');
+}
+
+// 15. 稳健模式：外点数量多于内点时仍按内点数量优先选出正确模型
+{
+  const inS = [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 0, y: 100 }, { x: 100, y: 100 }];
+  const inD = inS.map((p) => apply(TRUE_M, p));
+  const outS = [{ x: 300, y: 50 }, { x: 60, y: 300 }, { x: 330, y: 330 }, { x: 150, y: 220 }, { x: 260, y: 160 }];
+  const outD = [{ x: 500, y: 500 }, { x: 20, y: 610 }, { x: 90, y: 90 }, { x: 640, y: 200 }, { x: 180, y: 640 }];
+  const r = Affine.fitAffineRobust(inS.concat(outS), inD.concat(outD), { tolerance: 1.5 });
+  assert.strictEqual(r.inlierCount, 4);
+  assert.deepStrictEqual(r.inliers.slice(0, 4), [true, true, true, true]);
+  for (const k of ['a', 'b', 'c', 'd', 'e', 'f']) {
+    assert.ok(Math.abs(r.matrix[k] - TRUE_M[k]) < 1e-9, `外点主导时 ${k} 偏差过大`);
+  }
+  console.log('✓ 外点数量多于内点时仍选出正确模型');
+}
+
+// 16. 稳健模式：全部共线 → 无非共线三点候选，拒绝
+{
+  const col = [{ x: 0, y: 0 }, { x: 100, y: 100 }, { x: 200, y: 200 }, { x: 300, y: 300 }];
+  assert.throws(
+    () => Affine.fitAffineRobust(col, col.map((p) => apply(TRUE_M, p)), { tolerance: 2 }),
+    (e) => e.code === 'NO_VALID_TRIPLE'
+  );
+  console.log('✓ 稳健模式无非共线候选时抛出 NO_VALID_TRIPLE');
+}
+
+// 17. 稳健模式：非法容差 / 候选上限 → BAD_INPUT；点数不足 → TOO_FEW_POINTS
+{
+  const s3 = SRC.slice(0, 3);
+  const d3 = s3.map((p) => apply(TRUE_M, p));
+  assert.throws(() => Affine.fitAffineRobust(s3, d3, { tolerance: 0 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.fitAffineRobust(s3, d3, { tolerance: -2 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.fitAffineRobust(s3, d3, { maxCandidates: 0 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.fitAffineRobust(s3.slice(0, 2), d3.slice(0, 2)), (e) => e.code === 'TOO_FEW_POINTS');
+  console.log('✓ 非法容差/候选上限/点数不足被拒绝');
+}
+
 console.log('\n全部测试通过 ✔');

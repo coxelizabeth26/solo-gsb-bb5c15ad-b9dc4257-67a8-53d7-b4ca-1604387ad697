@@ -21,6 +21,12 @@
     </label>
     <button id="btnSample" type="button">载入示例图像</button>
     <button id="btnClear" type="button">清空控制点</button>
+    <label class="check-label" title="开启后自动剔除偏离整体的错误点对（有限候选稳健拟合）">
+      <input type="checkbox" id="robustMode"> 稳健模式
+    </label>
+    <label class="tol-label" title="内点判定阈值（参考图像素）：残差不超过该值的点参与最终拟合与 RMSE 统计">
+      容差 <input type="number" id="tolerance" min="0.1" max="1000" step="0.5" value="2" disabled> px
+    </label>
     <span class="spacer"></span>
     <button id="btnExportMatrix" type="button" disabled>导出矩阵 JSON</button>
     <button id="btnExportResiduals" type="button" disabled>导出残差 JSON</button>
@@ -47,7 +53,7 @@
       <table id="ptTable">
         <thead>
           <tr>
-            <th>#</th><th>扫描图 (x, y)</th><th>参考图 (x, y)</th><th>残差 (px)</th><th></th>
+            <th>#</th><th>扫描图 (x, y)</th><th>参考图 (x, y)</th><th>残差 (px)</th><th>类型</th><th></th>
           </tr>
         </thead>
         <tbody></tbody>

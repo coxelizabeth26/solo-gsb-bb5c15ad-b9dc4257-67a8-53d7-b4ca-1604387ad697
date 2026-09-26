@@ -2,7 +2,8 @@
  * 前端冒烟测试：node test/ui.smoke.js
  * 用最小 DOM/Canvas 桩在 Node 中执行 app.js，模拟完整用户流程：
  * 载入示例 → 成对点击 4 对控制点 → 拟合成功 → 导出矩阵/残差 →
- * 右键删点 → 清空 → 共线点被拒绝 → 透明度滑杆。
+ * 右键删点 → 清空 → 共线点被拒绝 → 透明度滑杆 →
+ * 稳健模式（外点剔除、内外点导出、容差调整重算、失败时保留点对并禁用导出）。
  * 同时校验 app.js 引用的所有 DOM id 都存在于 index.html。
  */
 'use strict';
@@ -25,7 +26,7 @@ function makeEl(tag) {
     listeners: {},
     _q: {},
     className: '', textContent: '', innerHTML: '', value: '0.5',
-    disabled: false, files: [], dataset: {},
+    disabled: false, checked: false, files: [], dataset: {},
     addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
     removeEventListener() {},
     querySelector(sel) { return this._q[sel] || (this._q[sel] = makeEl(sel)); },
@@ -153,6 +154,85 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   fire(els.opacity, 'input');
   assert.strictEqual(els.opacityVal.textContent, '80%');
   console.log('✓ 透明度滑杆联动');
+
+  // 8. 稳健模式：4 对正常点 + 1 对外点 → 外点被识别剔除
+  fire(els.btnClear, 'click');
+  for (const rp of refPts) {
+    clickCanvas(els.refCanvas, rp[0], rp[1]);
+    const sp = scanPt(rp);
+    clickCanvas(els.scanCanvas, sp[0], sp[1]);
+  }
+  clickCanvas(els.refCanvas, 480, 280);
+  const spO = scanPt([480, 280]);
+  clickCanvas(els.scanCanvas, spO[0] + 60, spO[1] - 40); // 外点：偏离约 72px
+  assert.ok(els.status.textContent.includes('拟合成功'));
+  assert.ok(!els.status.textContent.includes('内点'), '普通模式不应区分内外点');
+  console.log('✓ 普通模式：外点参与拟合');
+
+  els.tolerance.value = '2';
+  fire(els.tolerance, 'input'); // 未开稳健模式时仅记录容差
+  els.robustMode.checked = true;
+  fire(els.robustMode, 'change');
+  assert.ok(els.status.textContent.includes('内点 4/5'), '稳健模式应剔除外点: ' + els.status.textContent);
+  assert.ok(els.status.textContent.includes('RMSE（内点）'));
+  assert.ok(els.ptTable.querySelector('tbody').innerHTML.includes('外点'), '残差表应标出外点');
+  assert.strictEqual(els.tolerance.disabled, false, '稳健模式下容差输入应可用');
+  console.log('✓ 稳健模式：外点被识别，双图标记与残差表区分内外点');
+
+  // 9. 导出残差 JSON：记录内外点身份，RMSE 仅统计内点
+  fire(els.btnExportResiduals, 'click');
+  const rj2 = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(rj2.robust, true);
+  assert.strictEqual(rj2.rmseScope, 'inliers');
+  assert.strictEqual(rj2.points.filter((p) => p.isInlier).length, 4);
+  assert.strictEqual(rj2.points[4].isInlier, false);
+  const expectRmse = Math.sqrt(
+    rj2.points.filter((p) => p.isInlier).reduce((s, p) => s + p.residualPx ** 2, 0) / 4
+  );
+  assert.ok(Math.abs(rj2.rmse - expectRmse) < 1e-9, 'RMSE 应仅统计内点');
+  console.log('✓ 残差 JSON 记录内外点身份，RMSE 仅统计内点');
+
+  // 10. 导出矩阵 JSON：与残差导出使用同一最终矩阵
+  fire(els.btnExportMatrix, 'click');
+  const mj2 = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(mj2.robust, true);
+  assert.strictEqual(mj2.tolerance, 2);
+  assert.deepStrictEqual(mj2.inliers, [true, true, true, true, false]);
+  assert.strictEqual(mj2.rmse, rj2.rmse, '两种导出应使用同一最终矩阵与 RMSE');
+  const sp1 = scanPt(refPts[0]);
+  const ex = mj2.matrix.a * sp1[0] + mj2.matrix.b * sp1[1] + mj2.matrix.c;
+  const ey = mj2.matrix.d * sp1[0] + mj2.matrix.e * sp1[1] + mj2.matrix.f;
+  assert.ok(Math.hypot(ex - refPts[0][0], ey - refPts[0][1]) < 1e-6, '外点不应污染最终矩阵');
+  console.log('✓ 矩阵 JSON 记录内外点身份，两种导出共用同一最终矩阵');
+
+  // 11. 调整容差后同步重算：容差调大 → 外点变为内点
+  els.tolerance.value = '100';
+  fire(els.tolerance, 'input');
+  assert.ok(els.status.textContent.includes('内点 5/5'), '调大容差后应全部内点: ' + els.status.textContent);
+  console.log('✓ 调整容差后同步重算（5/5 内点）');
+
+  // 12. 稳健模式找不到非共线内点：保留点对、说明原因、禁用导出
+  els.tolerance.value = '2';
+  fire(els.tolerance, 'input');
+  fire(els.btnClear, 'click');
+  const refs2 = [[90, 90], [870, 110], [120, 540]];
+  const line2 = [[100, 100], [200, 200], [300, 300]]; // 扫描图侧共线
+  for (let i = 0; i < 3; i++) {
+    clickCanvas(els.refCanvas, refs2[i][0], refs2[i][1]);
+    clickCanvas(els.scanCanvas, line2[i][0], line2[i][1]);
+  }
+  assert.ok(els.status.textContent.includes('共线'), '应说明失败原因: ' + els.status.textContent);
+  assert.ok(els.status.className.includes('error'));
+  assert.strictEqual(rowCount(), 3, '拟合失败时点对应保留');
+  assert.ok(els.btnExportMatrix.disabled && els.btnExportResiduals.disabled, '导出应禁用');
+  console.log('✓ 找不到非共线内点时保留点对、说明原因并禁用导出');
+
+  // 13. 关闭稳健模式 → 回到普通最小二乘
+  els.robustMode.checked = false;
+  fire(els.robustMode, 'change');
+  assert.ok(els.status.textContent.includes('共线'), '普通模式同样拒绝共线');
+  assert.strictEqual(els.tolerance.disabled, true, '关闭稳健模式后容差输入应禁用');
+  console.log('✓ 稳健模式可切换关闭');
 
   console.log('\n前端冒烟测试全部通过 ✔');
 })().catch((err) => {
