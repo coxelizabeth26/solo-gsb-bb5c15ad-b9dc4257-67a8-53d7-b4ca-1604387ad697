@@ -114,4 +114,124 @@ function apply(m, p) {
   console.log('✓ 大坐标数值稳定');
 }
 
+// ---------- 稳健模式 fitAffineRobust ----------
+
+// 11. 无噪声：全部点为内点，精确还原
+{
+  const dst = SRC.map((p) => apply(TRUE_M, p));
+  const r = Affine.fitAffineRobust(SRC, dst, { tolerancePx: 2 });
+  for (const k of ['a', 'b', 'c', 'd', 'e', 'f']) {
+    assert.ok(Math.abs(r.matrix[k] - TRUE_M[k]) < 1e-9, `稳健拟合参数 ${k} 偏差过大`);
+  }
+  assert.strictEqual(r.inlierCount, SRC.length);
+  assert.strictEqual(r.outlierCount, 0);
+  assert.deepStrictEqual(r.inliers, SRC.map(() => true));
+  assert.ok(r.rmse < 1e-9);
+  assert.ok(r.candidatesEvaluated >= 1);
+  console.log('✓ 稳健模式无噪声：全内点精确还原');
+}
+
+// 12. 含一个粗大外点：外点被剔除，内点 RMSE 接近 0
+{
+  const dst = SRC.map((p) => apply(TRUE_M, p));
+  dst[5] = { x: 9999, y: -9999 }; // 粗大外点
+  const r = Affine.fitAffineRobust(SRC, dst, { tolerancePx: 2 });
+  assert.strictEqual(r.inlierCount, 5);
+  assert.strictEqual(r.outlierCount, 1);
+  assert.strictEqual(r.inliers[5], false);
+  assert.ok(r.rmse < 1e-9, '内点应精确拟合，RMSE≈0');
+  assert.ok(r.maxIndex !== 5, 'maxIndex 不应为外点');
+  assert.ok(r.maxIndex >= 0, '至少存在一个内点用于 maxIndex');
+  // 外点残差仍给出
+  assert.ok(r.residuals[5] > 1000, '外点残差应仍被计算');
+  console.log('✓ 稳健模式剔除粗大外点并精确拟合内点');
+}
+
+// 13. 对比经典模式：同一外点会拖偏 LS，稳健模式结果明显更优
+{
+  const dst = SRC.map((p) => apply(TRUE_M, p));
+  dst[2] = { x: dst[2].x + 40, y: dst[2].y + 40 };
+  const ls = Affine.fitAffine(SRC, dst);
+  const rb = Affine.fitAffineRobust(SRC, dst, { tolerancePx: 2 });
+  assert.ok(rb.inliers[2] === false);
+  assert.ok(rb.rmse < ls.rmse * 0.5, `稳健 RMSE 应远小于 LS: ${rb.rmse} vs ${ls.rmse}`);
+  console.log('✓ 稳健模式避免外点拖偏（RMSE 显著小于最小二乘）');
+}
+
+// 14. 容差影响：噪声 1px 时，tol=0 判多数为外点（候选自身除外），tol=3 全为内点
+{
+  let seed = 7;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 - 0.5; };
+  const dst = SRC.map((p) => {
+    const q = apply(TRUE_M, p);
+    return { x: q.x + rand() * 2, y: q.y + rand() * 2 }; // ±1px 噪声
+  });
+  const tight = Affine.fitAffineRobust(SRC, dst, { tolerancePx: 0.001 });
+  const loose = Affine.fitAffineRobust(SRC, dst, { tolerancePx: 3 });
+  assert.ok(tight.inlierCount >= 3 && tight.inlierCount < SRC.length, '紧容差下至少有候选三点、且非全内点');
+  assert.strictEqual(loose.inlierCount, SRC.length, '宽容差下全部为内点');
+  console.log('✓ 像素容差收紧/放宽正确改变内外点划分');
+}
+
+// 15. 全部共线：稳健模式抛出 NO_NONCOLLINEAR_TRIPLET
+{
+  const collinear = [{ x: 0, y: 0 }, { x: 100, y: 100 }, { x: 200, y: 200 }, { x: 300, y: 300 }];
+  const dst = collinear.map((p) => apply(TRUE_M, p));
+  assert.throws(() => Affine.fitAffineRobust(collinear, dst, { tolerancePx: 2 }),
+    (e) => e.code === 'NO_NONCOLLINEAR_TRIPLET');
+  console.log('✓ 稳健模式全共线抛出 NO_NONCOLLINEAR_TRIPLET');
+}
+
+// 16. 恰好 3 个非共线点：精确解，全部内点
+{
+  const src = SRC.slice(0, 3);
+  const dst = src.map((p) => apply(TRUE_M, p));
+  const r = Affine.fitAffineRobust(src, dst, { tolerancePx: 0 });
+  assert.strictEqual(r.inlierCount, 3);
+  assert.ok(r.rmse < 1e-9, 'tol=0 时三点自身残差为 0，应全部内点');
+  console.log('✓ 稳健模式 3 点（tol=0）精确解');
+}
+
+// 17. 少于 3 点 / 非法容差 / 非法输入
+{
+  assert.throws(() => Affine.fitAffineRobust(SRC.slice(0, 2), SRC.slice(0, 2)), /至少需要 3 对/);
+  assert.throws(() => Affine.fitAffineRobust(SRC, SRC, { tolerancePx: -1 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.fitAffineRobust('x', []), (e) => e.code === 'BAD_INPUT');
+  console.log('✓ 稳健模式参数校验（TOO_FEW_POINTS / BAD_INPUT）');
+}
+
+// 18. 候选上限：仅评估至多 MAX_CANDIDATES 个非共线候选，且固定顺序结果可复现
+{
+  // 8 个点共 C(8,3)=56 个三元组，全部评估
+  const n8 = SRC.concat([{ x: 200, y: 200 }, { x: 20, y: 160 }]);
+  const dst8 = n8.map((p) => apply(TRUE_M, p));
+  const r1 = Affine.fitAffineRobust(n8, dst8, { tolerancePx: 2 });
+  const r2 = Affine.fitAffineRobust(n8, dst8, { tolerancePx: 2 });
+  assert.strictEqual(r1.candidatesEvaluated, r2.candidatesEvaluated);
+  assert.strictEqual(r1.matrix.a, r2.matrix.a);
+  assert.ok(r1.candidatesEvaluated <= Affine.MAX_CANDIDATES);
+  // 上限取 1：只评估字典序首个三元组 (0,1,2)
+  const rOne = Affine.fitAffineRobust(n8, dst8, { tolerancePx: 2, maxCandidates: 1 });
+  assert.strictEqual(rOne.candidatesEvaluated, 1);
+  console.log('✓ 稳健模式候选有上限且固定顺序可复现');
+}
+
+// 19. 大量点（50 个，C(50,3)=19600）：计算量被上限约束，结果仍正确
+{
+  let seed = 99;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 - 0.5; };
+  const bigSrc = [];
+  for (let i = 0; i < 50; i++) bigSrc.push({ x: 200 * rand() + 10, y: 200 * rand() + 10 });
+  const bigDst = bigSrc.map((p) => apply(TRUE_M, p));
+  bigDst[49] = { x: 0, y: 0 }; // 外点
+  const t0 = Date.now();
+  const r = Affine.fitAffineRobust(bigSrc, bigDst, { tolerancePx: 2 });
+  const ms = Date.now() - t0;
+  assert.ok(r.candidatesEvaluated <= Affine.MAX_CANDIDATES, '扫描三元组数受上限约束');
+  assert.strictEqual(r.inliers[49], false);
+  assert.ok(r.rmse < 1e-9);
+  assert.ok(ms < 500, `50 点稳健拟合应快速完成，实际 ${ms}ms`);
+  console.log(`✓ 50 点稳健拟合有界且快速（${ms}ms，评估 ${r.candidatesEvaluated} 候选）`);
+}
+
 console.log('\n全部测试通过 ✔');

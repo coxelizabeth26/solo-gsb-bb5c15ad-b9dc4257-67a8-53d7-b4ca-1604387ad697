@@ -4,9 +4,11 @@
  *  - 上传参考图 / 扫描图（FileReader 本地读取，不上传服务器）
  *  - 两图成对点击标注控制点（任意一图先点均可，自动配对）
  *  - 拖动微调、右键删除、列表删除；任何变化立即重算仿射拟合
- *  - 残差实时列表，最大残差点红色高亮；近共线拒绝并提示
- *  - 叠加画布：参考图 + 经仿射变换的扫描图，透明度滑杆混合
- *  - 导出六参数矩阵 / 残差 JSON
+ *  - 可切换「稳健模式」：按参考图像素容差以内点数量优先枚举三点候选，
+ *    再对内点重新最小二乘拟合；外点在双图标记与残差表中区分显示，
+ *    不计入 RMSE。容差调整、点位编辑/删除均同步重算。
+ *  - 叠加预览与两种 JSON 导出共用同一最终矩阵，导出记录内/外点身份
+ *  - 残差实时列表，内点最大残差橙色高亮、外点红色标识；近共线拒绝并提示
  */
 (function () {
   'use strict';
@@ -18,15 +20,18 @@
     points: [],              // 已完成配对 {id, ref:{x,y}, scan:{x,y}}
     pending: { ref: null, scan: null }, // 进行中的半对点
     nextId: 1,
-    fit: null,               // {matrix, residuals, rmse, maxIndex, pointCount}
+    fit: null,               // 拟合结果（含 matrix/residuals/inliers 等）
     fitError: null,          // 近共线等错误提示（中文）
+    robust: false,           // 是否启用稳健模式
+    tolerancePx: Affine.DEFAULT_TOLERANCE_PX, // 稳健模式参考图像素容差
     dragging: null,          // {id, which:'ref'|'scan'}
     opacity: 0.5
   };
 
   const HIT_RADIUS_CSS = 12;   // 命中半径（CSS 像素）
-  const COLOR_OK = '#22c55e';
-  const COLOR_MAX = '#ef4444';
+  const COLOR_INLIER = '#22c55e';   // 内点：绿
+  const COLOR_OUTLIER = '#ef4444';  // 外点：红（虚线）
+  const COLOR_MAX = '#f59e0b';      // 内点中最大残差：橙
   const COLOR_PENDING = '#eab308';
 
   // ---------- DOM ----------
@@ -43,6 +48,9 @@
   const btnExportMatrix = $('btnExportMatrix');
   const btnExportResiduals = $('btnExportResiduals');
   const btnClear = $('btnClear');
+  const robustModeInput = $('robustMode');
+  const toleranceInput = $('tolerance');
+  const tolLabel = $('tolLabel');
 
   // ---------- 图像加载 ----------
   function loadImageFromFile(file) {
@@ -87,15 +95,21 @@
   }
 
   // ---------- 拟合 ----------
+  // 判断第 i 对控制点是否为内点（经典模式下所有点都是内点）
+  function isInlier(i) {
+    return !state.fit || !state.fit.inliers || state.fit.inliers[i];
+  }
+
   function recompute() {
     state.fit = null;
     state.fitError = null;
     if (state.points.length >= Affine.MIN_POINTS) {
       try {
-        state.fit = Affine.fitAffine(
-          state.points.map((p) => p.scan), // 源：扫描图
-          state.points.map((p) => p.ref)   // 目标：参考图
-        );
+        const src = state.points.map((p) => p.scan); // 源：扫描图
+        const dst = state.points.map((p) => p.ref);  // 目标：参考图
+        state.fit = state.robust
+          ? Affine.fitAffineRobust(src, dst, { tolerancePx: state.tolerancePx })
+          : Affine.fitAffine(src, dst);
       } catch (err) {
         state.fitError = err.message || String(err);
       }
@@ -197,17 +211,24 @@
     ctx.fillText(text, canvas.width / 2, canvas.height / 2);
   }
 
-  function drawMarker(ctx, p, label, color, scale, dashed) {
+  function drawMarker(ctx, p, label, color, scale, opts) {
+    opts = opts || {};
     const r = 9 * scale;
     ctx.save();
     ctx.lineWidth = 2 * scale;
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
-    if (dashed) ctx.setLineDash([4 * scale, 3 * scale]);
+    if (opts.dashed) ctx.setLineDash([4 * scale, 3 * scale]);
     ctx.beginPath();
     ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
     ctx.stroke();
     ctx.setLineDash([]);
+    // 内点最大残差：额外一圈橙色高亮环
+    if (opts.ring) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r + 4 * scale, 0, Math.PI * 2);
+      ctx.stroke();
+    }
     // 中心十字
     ctx.beginPath();
     ctx.moveTo(p.x - r * 0.55, p.y); ctx.lineTo(p.x + r * 0.55, p.y);
@@ -224,6 +245,18 @@
     ctx.restore();
   }
 
+  // 第 i 对点的标记样式：外点红色虚线；内点中最大残差橙色加环；其余绿色
+  function markerStyle(i) {
+    const f = state.fit;
+    if (f && f.inliers && !f.inliers[i]) {
+      return { color: COLOR_OUTLIER, dashed: true, ring: false };
+    }
+    if (f && i === f.maxIndex) {
+      return { color: COLOR_MAX, dashed: false, ring: true };
+    }
+    return { color: COLOR_INLIER, dashed: false, ring: false };
+  }
+
   function drawImageCanvas(canvas, img, which) {
     if (!img) {
       drawPlaceholder(canvas, which === 'ref' ? '请先上传参考图' : '请先上传扫描图');
@@ -236,14 +269,13 @@
     const ctx = canvas.getContext('2d');
     ctx.drawImage(img, 0, 0);
     const scale = canvasScale(canvas);
-    const maxIdx = state.fit ? state.fit.maxIndex : -1;
 
     state.points.forEach((pt, i) => {
-      const color = i === maxIdx ? COLOR_MAX : COLOR_OK;
-      drawMarker(ctx, pt[which], String(i + 1), color, scale, false);
+      const s = markerStyle(i);
+      drawMarker(ctx, pt[which], String(i + 1), s.color, scale, { dashed: s.dashed, ring: s.ring });
     });
     const pending = state.pending[which];
-    if (pending) drawMarker(ctx, pending, '?', COLOR_PENDING, scale, true);
+    if (pending) drawMarker(ctx, pending, '?', COLOR_PENDING, scale, { dashed: true });
   }
 
   function drawOverlay() {
@@ -272,10 +304,9 @@
     }
 
     const scale = canvasScale(overlayCanvas);
-    const maxIdx = state.fit ? state.fit.maxIndex : -1;
     state.points.forEach((pt, i) => {
-      const color = i === maxIdx ? COLOR_MAX : COLOR_OK;
-      drawMarker(ctx, pt.ref, String(i + 1), color, scale, false);
+      const s = markerStyle(i);
+      drawMarker(ctx, pt.ref, String(i + 1), s.color, scale, { dashed: s.dashed, ring: s.ring });
     });
   }
 
@@ -305,15 +336,25 @@
       return;
     }
     if (state.fitError) {
-      setStatus('拟合失败：' + state.fitError, 'error');
+      // 找不到至少三对非共线内点时：保留点对，说明原因（导出按钮随后禁用）
+      setStatus('无法拟合：' + state.fitError, 'error');
       return;
     }
     const f = state.fit;
-    setStatus(
-      `拟合成功 · ${f.pointCount} 对点 · RMSE = ${fmt(f.rmse, 3)} px · ` +
-      `最大残差点：#${f.maxIndex + 1}（${fmt(f.residuals[f.maxIndex], 3)} px，已红色标出）`,
-      'ok'
-    );
+    if (state.robust) {
+      setStatus(
+        `稳健拟合成功 · 内点 ${f.inlierCount} 对 / 外点 ${f.outlierCount} 对` +
+        `（容差 ${fmt(f.tolerancePx, 2)} px，评估 ${f.candidatesEvaluated} 个三点候选）· ` +
+        `内点 RMSE = ${fmt(f.rmse, 3)} px · 外点已在图与表中红色标出，不计入 RMSE`,
+        'ok'
+      );
+    } else {
+      setStatus(
+        `拟合成功 · ${f.pointCount} 对点 · RMSE = ${fmt(f.rmse, 3)} px · ` +
+        `最大残差点：#${f.maxIndex + 1}（${fmt(f.residuals[f.maxIndex], 3)} px，已橙色标出）`,
+        'ok'
+      );
+    }
   }
 
   function renderFitPanel() {
@@ -327,23 +368,44 @@
     const rows = ['a', 'b', 'c', 'd', 'e', 'f']
       .map((k) => `<div class="mrow"><span>${k}</span><code>${Number(m[k]).toPrecision(8)}</code></div>`)
       .join('');
+    let extra;
+    if (state.robust) {
+      extra =
+        `<p class="muted">稳健模式：像素容差 ${fmt(state.fit.tolerancePx, 2)} px · ` +
+        `内点 ${state.fit.inlierCount} / 共 ${state.fit.pointCount} 对（外点 ${state.fit.outlierCount} 对不参与拟合与 RMSE）</p>`;
+    } else {
+      extra = '<p class="muted">经典最小二乘：全部控制点参与拟合</p>';
+    }
     fitPanelEl.innerHTML =
       `<div class="matrix">${rows}</div>` +
       `<p class="muted">u = a·x + b·y + c<br>v = d·x + e·y + f（扫描图 → 参考图）</p>` +
-      `<p>RMSE：<strong>${fmt(state.fit.rmse, 4)}</strong> px</p>`;
+      extra +
+      `<p>${state.robust ? '内点 RMSE' : 'RMSE'}：<strong>${fmt(state.fit.rmse, 4)}</strong> px</p>`;
   }
 
   function renderTable() {
     ptCountEl.textContent = state.points.length ? `（${state.points.length} 对）` : '';
-    const maxIdx = state.fit ? state.fit.maxIndex : -1;
     ptTableBody.innerHTML = state.points.map((pt, i) => {
       const r = state.fit ? fmt(state.fit.residuals[i], 3) : '—';
-      const cls = i === maxIdx ? ' class="max-row"' : '';
+      let cls = '';
+      let verdict = '';
+      if (state.fit && state.fit.inliers) {
+        if (!state.fit.inliers[i]) {
+          cls = ' class="out-row"';
+          verdict = '<span class="badge out">外点</span>';
+        } else {
+          verdict = '<span class="badge in">内点</span>';
+          if (i === state.fit.maxIndex) cls = ' class="max-row"';
+        }
+      } else if (state.fit && i === state.fit.maxIndex) {
+        cls = ' class="max-row"';
+      }
       return `<tr${cls}>
         <td>${i + 1}</td>
         <td>${fmt(pt.scan.x, 1)}, ${fmt(pt.scan.y, 1)}</td>
         <td>${fmt(pt.ref.x, 1)}, ${fmt(pt.ref.y, 1)}</td>
         <td>${r}</td>
+        <td>${verdict}</td>
         <td><button class="del" data-id="${pt.id}" title="删除该点">✕</button></td>
       </tr>`;
     }).join('');
@@ -381,27 +443,42 @@
   function exportMatrix() {
     if (!state.fit) return;
     const m = state.fit.matrix;
+    const f = state.fit;
     downloadJSON('affine-matrix.json', {
       description: '仿射变换六参数：u = a·x + b·y + c，v = d·x + e·y + f（扫描图坐标 → 参考图坐标）',
+      mode: state.robust ? 'robust' : 'leastSquares',
       matrix: m,
       matrixRowMajor: [[m.a, m.b, m.c], [m.d, m.e, m.f], [0, 0, 1]],
-      rmse: state.fit.rmse,
-      pointCount: state.fit.pointCount,
+      rmse: f.rmse,
+      rmseScope: state.robust ? 'inliers' : 'all',
+      pointCount: f.pointCount,
+      ...(state.robust ? {
+        tolerancePx: f.tolerancePx,
+        inlierCount: f.inlierCount,
+        outlierCount: f.outlierCount
+      } : {}),
       exportedAt: new Date().toISOString()
     });
   }
 
   function exportResiduals() {
     if (!state.fit) return;
+    const f = state.fit;
     downloadJSON('residuals.json', {
-      rmse: state.fit.rmse,
-      maxResidualIndex: state.fit.maxIndex + 1,
+      mode: state.robust ? 'robust' : 'leastSquares',
+      rmse: f.rmse,
+      rmseScope: state.robust ? 'inliers' : 'all',
+      ...(state.robust ? { tolerancePx: f.tolerancePx } : {}),
+      inlierCount: state.robust ? f.inlierCount : f.pointCount,
+      outlierCount: state.robust ? f.outlierCount : 0,
+      maxResidualIndex: f.maxIndex + 1,
       points: state.points.map((pt, i) => ({
         id: i + 1,
         scan: pt.scan,
         ref: pt.ref,
-        residualPx: state.fit.residuals[i],
-        isMaxResidual: i === state.fit.maxIndex
+        residualPx: f.residuals[i],
+        isInlier: isInlier(i),
+        isMaxResidual: i === f.maxIndex
       })),
       exportedAt: new Date().toISOString()
     });
@@ -477,6 +554,27 @@
       state.opacity = parseFloat(opacityInput.value);
       opacityVal.textContent = Math.round(state.opacity * 100) + '%';
       drawOverlay();
+    });
+
+    // 稳健模式开关：切换后立即重算，并同步容差输入的可用状态
+    robustModeInput.addEventListener('change', () => {
+      state.robust = !!robustModeInput.checked;
+      toleranceInput.disabled = !state.robust;
+      recompute();
+    });
+
+    // 像素容差：编辑（input）即时同步重算；非法值给出提示并禁用导出
+    toleranceInput.addEventListener('input', () => {
+      const v = parseFloat(toleranceInput.value);
+      if (!Number.isFinite(v) || v < 0) {
+        state.tolerancePx = NaN;
+        state.fit = null;
+        state.fitError = '像素容差必须为不小于 0 的数字（参考图像素）。';
+        render();
+        return;
+      }
+      state.tolerancePx = v;
+      recompute();
     });
 
     ptTableBody.addEventListener('click', (e) => {

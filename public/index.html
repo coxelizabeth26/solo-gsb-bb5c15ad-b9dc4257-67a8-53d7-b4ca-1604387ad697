@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>扫描印刷稿套色偏移校准</h1>
-    <p class="sub">上传参考图与扫描图 → 成对点击控制点（≥ 3 对）→ 仿射最小二乘拟合 → 叠加预览与残差分析</p>
+    <p class="sub">上传参考图与扫描图 → 成对点击控制点（≥ 3 对）→ 仿射拟合（可切换稳健模式剔除误标点）→ 叠加预览与残差分析</p>
   </header>
 
   <section class="toolbar">
@@ -22,6 +22,14 @@
     <button id="btnSample" type="button">载入示例图像</button>
     <button id="btnClear" type="button">清空控制点</button>
     <span class="spacer"></span>
+    <label class="opt-label" title="按参考图像素容差筛除外点，再对内点重新最小二乘拟合">
+      <input type="checkbox" id="robustMode"> 稳健模式
+    </label>
+    <label class="opt-label tol-label" id="tolLabel" title="残差不超过该值（参考图像素）的点对计为内点">
+      像素容差
+      <input type="number" id="tolerance" min="0" max="100" step="0.5" value="2" disabled>
+      px
+    </label>
     <button id="btnExportMatrix" type="button" disabled>导出矩阵 JSON</button>
     <button id="btnExportResiduals" type="button" disabled>导出残差 JSON</button>
   </section>
@@ -47,7 +55,7 @@
       <table id="ptTable">
         <thead>
           <tr>
-            <th>#</th><th>扫描图 (x, y)</th><th>参考图 (x, y)</th><th>残差 (px)</th><th></th>
+            <th>#</th><th>扫描图 (x, y)</th><th>参考图 (x, y)</th><th>残差 (px)</th><th>判定</th><th></th>
           </tr>
         </thead>
         <tbody></tbody>

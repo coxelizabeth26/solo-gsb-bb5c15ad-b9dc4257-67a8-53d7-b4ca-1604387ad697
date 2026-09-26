@@ -2,7 +2,9 @@
  * 前端冒烟测试：node test/ui.smoke.js
  * 用最小 DOM/Canvas 桩在 Node 中执行 app.js，模拟完整用户流程：
  * 载入示例 → 成对点击 4 对控制点 → 拟合成功 → 导出矩阵/残差 →
- * 右键删点 → 清空 → 共线点被拒绝 → 透明度滑杆。
+ * 右键删点 → 清空 → 共线点被拒绝 → 透明度滑杆 →
+ * 稳健模式：共线仍拒绝 → 外点剔除与导出身份 → 拖动外点归位 →
+ * 容差调整（含非法值）→ 关闭稳健模式回到经典最小二乘。
  * 同时校验 app.js 引用的所有 DOM id 都存在于 index.html。
  */
 'use strict';
@@ -25,7 +27,7 @@ function makeEl(tag) {
     listeners: {},
     _q: {},
     className: '', textContent: '', innerHTML: '', value: '0.5',
-    disabled: false, files: [], dataset: {},
+    checked: false, disabled: false, files: [], dataset: {},
     addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
     removeEventListener() {},
     querySelector(sel) { return this._q[sel] || (this._q[sel] = makeEl(sel)); },
@@ -43,7 +45,9 @@ function makeCanvas() {
   return el;
 }
 
-global.window = { addEventListener() {} };
+const winListeners = {};
+global.window = { addEventListener(type, fn) { (winListeners[type] = winListeners[type] || []).push(fn); } };
+const fireWindow = (type, ev) => (winListeners[type] || []).forEach((fn) => fn(ev));
 global.document = {
   getElementById(id) {
     requestedIds.add(id);
@@ -153,6 +157,100 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   fire(els.opacity, 'input');
   assert.strictEqual(els.opacityVal.textContent, '80%');
   console.log('✓ 透明度滑杆联动');
+
+  // 8. 稳健模式：当前 3 个共线点仍被拒绝，点对保留、导出禁用
+  els.robustMode.checked = true;
+  fire(els.robustMode, 'change');
+  assert.ok(els.tolerance.disabled === false, '稳健模式开启后容差输入应可用');
+  assert.ok(els.status.textContent.includes('非共线'), '稳健模式也应提示无非共线三点: ' + els.status.textContent);
+  assert.ok(els.btnExportMatrix.disabled, '无非共线三点时导出必须禁用');
+  assert.strictEqual(rowCount(), 3, '拒绝拟合时点对应保留');
+  console.log('✓ 稳健模式下无非共线三点：说明原因、保留点对、禁用导出');
+
+  // 9. 清空后打 4 个精确内点 + 1 个粗大外点，稳健模式剔除外点
+  fire(els.btnClear, 'click');
+  const good = [refPts[0], refPts[1], refPts[2], refPts[3]];
+  for (const rp of good) {
+    clickCanvas(els.refCanvas, rp[0], rp[1]);
+    const sp = scanPt(rp);
+    clickCanvas(els.scanCanvas, sp[0], sp[1]);
+  }
+  // 第 5 对：参考点与第 1 对相同，扫描点放在完全错误的位置
+  clickCanvas(els.refCanvas, refPts[0][0], refPts[0][1] + 60);
+  clickCanvas(els.scanCanvas, 600, 400);
+  assert.strictEqual(rowCount(), 5);
+  assert.ok(els.status.textContent.includes('内点 4'), '应识别 4 个内点: ' + els.status.textContent);
+  assert.ok(els.status.textContent.includes('外点 1'), '应识别 1 个外点: ' + els.status.textContent);
+  assert.ok(els.status.textContent.includes('不计入 RMSE'));
+  assert.ok(els.fitPanel.innerHTML.includes('内点 4 / 共 5'));
+  // 表格：1 行外点（红）、4 行带「内点」徽章
+  const outRows = (els.ptTable.querySelector('tbody').innerHTML.match(/out-row/g) || []).length;
+  const inBadges = (els.ptTable.querySelector('tbody').innerHTML.match(/badge in/g) || []).length;
+  assert.strictEqual(outRows, 1);
+  assert.strictEqual(inBadges, 4);
+  console.log('✓ 稳健模式：双图/残差表区分内外点，外点不计 RMSE');
+
+  // 10. 两种导出记录内外点身份，且矩阵为同一最终矩阵
+  fire(els.btnExportMatrix, 'click');
+  const mj2 = JSON.parse(await blobs[2].text());
+  assert.strictEqual(mj2.mode, 'robust');
+  assert.strictEqual(mj2.rmseScope, 'inliers');
+  assert.strictEqual(mj2.inlierCount, 4);
+  assert.strictEqual(mj2.outlierCount, 1);
+  assert.strictEqual(mj2.tolerancePx, 2);
+  fire(els.btnExportResiduals, 'click');
+  const rj2 = JSON.parse(await blobs[3].text());
+  assert.strictEqual(rj2.points.length, 5);
+  assert.strictEqual(rj2.points.filter((p) => p.isInlier).length, 4);
+  assert.strictEqual(rj2.points.filter((p) => !p.isInlier).length, 1);
+  assert.strictEqual(rj2.points[4].isInlier, false);
+  assert.strictEqual(rj2.points[4].isMaxResidual, false, '外点不应标记为最大残差内点');
+  const mm = mj2.matrix;
+  assert.ok(Math.hypot(
+    mm.a * scanPt(refPts[0])[0] + mm.b * scanPt(refPts[0])[1] + mm.c - refPts[0][0],
+    mm.d * scanPt(refPts[0])[0] + mm.e * scanPt(refPts[0])[1] + mm.f - refPts[0][1]
+  ) < 1e-6, '导出矩阵应与叠加预览使用的最终矩阵一致（精确恢复内点映射）');
+  console.log('✓ 稳健模式导出：同一最终矩阵 + 逐点内外点身份');
+
+  // 11. 拖动外点标记到正确位置 → 同步重算，变为 5 个内点
+  const correct = scanPt([refPts[0][0], refPts[0][1] + 60]);
+  fire(els.scanCanvas, 'mousedown', { button: 0, clientX: 600, clientY: 400, preventDefault() {} });
+  fireWindow('mousemove', { clientX: correct[0], clientY: correct[1] });
+  fireWindow('mouseup', {});
+  assert.ok(els.status.textContent.includes('内点 5'), '拖动归位后应为 5 个内点: ' + els.status.textContent);
+  assert.ok(els.status.textContent.includes('外点 0'));
+  assert.ok(els.status.textContent.includes('RMSE'));
+  console.log('✓ 点位编辑（拖动）后同步重算，外点变为内点');
+
+  // 12. 容差调整即时重算：改为 0 px 仍为全内点（点完全精确）
+  els.tolerance.value = '0';
+  fire(els.tolerance, 'input');
+  assert.strictEqual(els.status.className.includes('error'), false, '容差 0 合法');
+  assert.ok(els.status.textContent.includes('容差 0.00'));
+  assert.ok(els.status.textContent.includes('内点 5'));
+  // 非法容差：说明原因并禁用导出，点对保留
+  els.tolerance.value = '-1';
+  fire(els.tolerance, 'input');
+  assert.ok(els.status.textContent.includes('像素容差'), '非法容差应说明原因: ' + els.status.textContent);
+  assert.ok(els.btnExportMatrix.disabled);
+  assert.strictEqual(rowCount(), 5);
+  // 恢复合法容差
+  els.tolerance.value = '2';
+  fire(els.tolerance, 'input');
+  assert.ok(els.status.textContent.includes('内点 5'));
+  console.log('✓ 容差调整同步重算；非法容差提示并禁用导出');
+
+  // 13. 关闭稳健模式 → 回到经典最小二乘，全部点参与拟合
+  els.robustMode.checked = false;
+  fire(els.robustMode, 'change');
+  assert.ok(els.tolerance.disabled, '关闭稳健模式后容差输入应禁用');
+  assert.ok(els.status.textContent.includes('拟合成功'), '经典模式应拟合成功: ' + els.status.textContent);
+  fire(els.btnExportMatrix, 'click');
+  const mj3 = JSON.parse(await blobs[4].text());
+  assert.strictEqual(mj3.mode, 'leastSquares');
+  assert.strictEqual(mj3.rmseScope, 'all');
+  assert.strictEqual(mj3.pointCount, 5);
+  console.log('✓ 关闭稳健模式后回到经典最小二乘（导出 mode/rmseScope 对应）');
 
   console.log('\n前端冒烟测试全部通过 ✔');
 })().catch((err) => {

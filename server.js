@@ -2,10 +2,13 @@
  * Express 服务：
  *  - 托管 public/ 下的前端静态资源
  *  - GET  /api/health  健康检查
- *  - POST /api/fit     仿射最小二乘拟合（与前端共用 public/js/affine.js）
- *                      请求体: { "src": [{x,y}...], "dst": [{x,y}...] }（≥3 对）
- *                      成功: 200 { ok:true, matrix, residuals, rmse, maxIndex, pointCount }
- *                      失败: 400 参数非法 / 422 点数不足或近共线
+ *  - POST /api/fit     仿射拟合（与前端共用 public/js/affine.js）
+ *                      请求体: { "src": [{x,y}...], "dst": [{x,y}...],
+ *                                "robust"?: boolean, "tolerancePx"?: number }（≥3 对）
+ *                      robust=true 时采用稳健模式（内点重拟合 + 外点剔除）
+ *                      成功: 200 { ok:true, mode, matrix, residuals, rmse,
+ *                                  maxIndex, pointCount, inliers, ... }
+ *                      失败: 400 参数非法 / 422 点数不足、近共线或无可用非共线三点
  */
 'use strict';
 
@@ -24,10 +27,14 @@ app.get('/api/health', (req, res) => {
 });
 
 app.post('/api/fit', (req, res) => {
-  const { src, dst } = req.body || {};
+  const { src, dst, robust, tolerancePx } = req.body || {};
   try {
-    const result = Affine.fitAffine(src, dst);
-    res.json({ ok: true, ...result });
+    const result = robust
+      ? Affine.fitAffineRobust(src, dst, {
+        tolerancePx: tolerancePx === undefined ? Affine.DEFAULT_TOLERANCE_PX : tolerancePx
+      })
+      : Affine.fitAffine(src, dst);
+    res.json({ ok: true, mode: robust ? 'robust' : 'leastSquares', ...result });
   } catch (err) {
     const status = err.code === 'BAD_INPUT' ? 400 : 422;
     res.status(status).json({
