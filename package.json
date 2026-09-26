@@ -1,0 +1,17 @@
+{
+  "name": "print-registration-calibrator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "扫描印刷稿套色偏移校准工具：控制点仿射最小二乘拟合、残差分析与叠加预览",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/affine.test.js && node test/ui.smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
